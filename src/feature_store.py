@@ -1,16 +1,12 @@
-"""
-SageMaker Feature Store simulation.
-Serves 120 engineered features to 4 downstream risk models,
-cutting ML training job duration 35% via shared feature computation.
-"""
-from typing import List, Dict, Any, Optional
-from datetime import datetime
 import json
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
-import numpy as np
 
 
+# feature groups served to downstream risk/fraud models
 FEATURE_GROUPS = {
     "transaction_velocity": [
         "txn_count_1h", "txn_count_24h", "txn_count_7d",
@@ -41,15 +37,10 @@ FEATURE_GROUPS = {
 
 
 class FeatureStore:
-    """
-    Local Feature Store backed by Parquet.
-    In production: AWS SageMaker Feature Store with online/offline stores.
-    """
-
     def __init__(self, store_path: str = "data/feature_store"):
         self.store_path = Path(store_path)
         self.store_path.mkdir(parents=True, exist_ok=True)
-        self._registry: Dict[str, Dict[str, Any]] = self._load_registry()
+        self._registry: Dict[str, Dict] = self._load_registry()
 
     def register_feature_group(
         self,
@@ -59,7 +50,6 @@ class FeatureStore:
         event_time_col: str = "timestamp",
         description: str = "",
     ):
-        """Register a feature group definition."""
         self._registry[group_name] = {
             "features": feature_definitions,
             "entity_col": entity_col,
@@ -69,24 +59,22 @@ class FeatureStore:
             "record_count": 0,
         }
         self._save_registry()
-        print(f"[FeatureStore] Registered group '{group_name}' with {len(feature_definitions)} features")
+        print(f"[FeatureStore] registered '{group_name}' ({len(feature_definitions)} features)")
 
     def ingest(self, group_name: str, df: pd.DataFrame):
-        """Write feature records to the offline store."""
         if group_name not in self._registry:
-            raise ValueError(f"Feature group '{group_name}' not registered. Call register_feature_group() first.")
+            raise ValueError(f"Feature group '{group_name}' not registered.")
 
         path = self.store_path / f"{group_name}.parquet"
         df["_ingested_at"] = datetime.utcnow().isoformat()
 
         if path.exists():
-            existing = pd.read_parquet(path)
-            df = pd.concat([existing, df], ignore_index=True)
+            df = pd.concat([pd.read_parquet(path), df], ignore_index=True)
 
         df.to_parquet(path, index=False)
         self._registry[group_name]["record_count"] = len(df)
         self._save_registry()
-        print(f"[FeatureStore] Ingested {len(df)} records into '{group_name}'")
+        print(f"[FeatureStore] ingested {len(df)} records → '{group_name}'")
 
     def get_features(
         self,
@@ -95,10 +83,6 @@ class FeatureStore:
         feature_names: Optional[List[str]] = None,
         as_of: Optional[datetime] = None,
     ) -> pd.DataFrame:
-        """
-        Retrieve features from the offline store.
-        Supports point-in-time correct lookups for model training.
-        """
         if group_name not in self._registry:
             raise ValueError(f"Feature group '{group_name}' not registered.")
 
@@ -110,24 +94,19 @@ class FeatureStore:
         entity_col = self._registry[group_name]["entity_col"]
         event_time_col = self._registry[group_name]["event_time_col"]
 
-        if as_of is not None and event_time_col in df.columns:
+        if as_of and event_time_col in df.columns:
             df = df[pd.to_datetime(df[event_time_col]) <= as_of]
 
-        if entity_ids is not None and entity_col in df.columns:
+        if entity_ids and entity_col in df.columns:
             df = df[df[entity_col].isin(entity_ids)]
 
-        if feature_names is not None:
+        if feature_names:
             available = [f for f in feature_names if f in df.columns]
             df = df[[entity_col] + available]
 
         return df
 
-    def join_feature_groups(
-        self,
-        group_names: List[str],
-        entity_ids: Optional[List[str]] = None,
-    ) -> pd.DataFrame:
-        """Join multiple feature groups on entity key — used for training dataset assembly."""
+    def join_feature_groups(self, group_names: List[str], entity_ids=None) -> pd.DataFrame:
         frames = {}
         for name in group_names:
             entity_col = self._registry.get(name, {}).get("entity_col", "from_address")
@@ -140,48 +119,32 @@ class FeatureStore:
 
         result = list(frames.values())[0]
         for df in list(frames.values())[1:]:
-            result = result.join(df, how="outer", rsuffix=f"_dup")
+            result = result.join(df, how="outer")
         return result.reset_index()
 
     def describe(self) -> Dict[str, Any]:
-        """Return a summary of all registered feature groups."""
-        total_features = sum(len(v["features"]) for v in self._registry.values())
+        total = sum(len(v["features"]) for v in self._registry.values())
         return {
             "feature_groups": len(self._registry),
-            "total_features": total_features,
+            "total_features": total,
             "groups": {k: {"features": len(v["features"]), "records": v["record_count"]} for k, v in self._registry.items()},
         }
 
-    def _load_registry(self) -> Dict[str, Any]:
-        registry_path = self.store_path / "_registry.json"
-        if registry_path.exists():
-            with open(registry_path) as f:
-                return json.load(f)
-        return {}
+    def _load_registry(self) -> Dict:
+        p = self.store_path / "_registry.json"
+        return json.load(open(p)) if p.exists() else {}
 
     def _save_registry(self):
-        registry_path = self.store_path / "_registry.json"
-        with open(registry_path, "w") as f:
+        with open(self.store_path / "_registry.json", "w") as f:
             json.dump(self._registry, f, indent=2)
 
 
-def build_training_feature_store(
-    df: pd.DataFrame,
-    store_path: str = "data/feature_store",
-) -> FeatureStore:
-    """Initialize and populate the feature store from a transformed DataFrame."""
+def build_training_feature_store(df: pd.DataFrame, store_path: str = "data/feature_store") -> FeatureStore:
     store = FeatureStore(store_path)
-
     for group_name, features in FEATURE_GROUPS.items():
-        store.register_feature_group(
-            group_name=group_name,
-            feature_definitions=features,
-            description=f"Auto-registered group: {group_name}",
-        )
-        available_cols = [c for c in features if c in df.columns]
-        if available_cols and "from_address" in df.columns:
-            subset = df[["from_address", "timestamp"] + available_cols].copy()
-            store.ingest(group_name, subset)
-
-    print(f"\nFeature Store summary: {store.describe()}")
+        store.register_feature_group(group_name, features)
+        available = [c for c in features if c in df.columns]
+        if available and "from_address" in df.columns:
+            store.ingest(group_name, df[["from_address", "timestamp"] + available].copy())
+    print(f"\nFeature Store: {store.describe()}")
     return store

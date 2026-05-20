@@ -1,30 +1,23 @@
-"""PySpark-compatible transformation layer — runs locally with Pandas, swap to PySpark in prod."""
-from typing import List, Optional, Dict
-from datetime import datetime
-import pandas as pd
+from typing import Dict, List
+
 import numpy as np
+import pandas as pd
 
 
 def deduplicate(df: pd.DataFrame, key_cols: List[str], keep: str = "last") -> pd.DataFrame:
-    """
-    Idempotent deduplication — watermark-based CDC means the same record can arrive
-    multiple times on pipeline retry. Zero-duplicate guarantee enforced here.
-    """
     before = len(df)
     df = df.drop_duplicates(subset=key_cols, keep=keep)
     dropped = before - len(df)
     if dropped:
-        print(f"[deduplicate] Dropped {dropped} duplicate rows on {key_cols}")
+        print(f"[deduplicate] dropped {dropped} dupes on {key_cols}")
     return df
 
 
 def filter_confirmed(df: pd.DataFrame, status_col: str = "status") -> pd.DataFrame:
-    """Only process confirmed transactions downstream."""
     return df[df[status_col] == "confirmed"].copy()
 
 
 def enrich_time_features(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
-    """Add temporal partitioning columns used downstream for Redshift query performance."""
     df = df.copy()
     ts = pd.to_datetime(df[ts_col])
     df["year"] = ts.dt.year
@@ -42,10 +35,6 @@ def compute_rolling_aggregates(
     amount_col: str = "amount_usd",
     windows: List[int] = [1, 24, 168],
 ) -> pd.DataFrame:
-    """
-    Rolling velocity aggregates — the same features that SageMaker Feature Store
-    serves to all downstream risk models (120 features, 4 models).
-    """
     df = df.copy().sort_values([group_col, "timestamp"])
 
     for w in windows:
@@ -62,7 +51,6 @@ def compute_rolling_aggregates(
             df.groupby(group_col)[amount_col]
             .transform(lambda x: x.rolling(window=w, min_periods=1).mean())
         )
-
     return df
 
 
@@ -71,7 +59,6 @@ def standardize_amounts(
     amount_col: str = "amount_usd",
     fee_col: str = "gas_fee_usd",
 ) -> pd.DataFrame:
-    """Log-normalize amounts and compute fee ratios for downstream models."""
     df = df.copy()
     df["amount_log"] = np.log1p(df[amount_col])
     df["fee_ratio"] = df[fee_col] / (df[amount_col] + 1e-6)
@@ -84,10 +71,7 @@ def apply_schema_evolution(
     expected_schema: Dict[str, str],
     fill_defaults: bool = True,
 ) -> pd.DataFrame:
-    """
-    Handle schema drift gracefully — new columns from upstream sources are added,
-    missing expected columns are filled with defaults (mirrors Glue Data Catalog versioning).
-    """
+    """Handle upstream schema drift without crashing downstream jobs."""
     df = df.copy()
     for col, dtype in expected_schema.items():
         if col not in df.columns:
@@ -104,18 +88,10 @@ def apply_schema_evolution(
 
 
 def _default_for_dtype(dtype: str):
-    mapping = {
-        "float64": 0.0,
-        "int64": 0,
-        "string": "",
-        "object": None,
-        "bool": False,
-    }
-    return mapping.get(dtype, None)
+    return {"float64": 0.0, "int64": 0, "string": "", "object": None, "bool": False}.get(dtype)
 
 
 def run_transformations(df: pd.DataFrame) -> pd.DataFrame:
-    """Full transformation chain — called by Airflow DAG."""
     df = deduplicate(df, key_cols=["transaction_hash"])
     df = filter_confirmed(df)
     df = enrich_time_features(df)
