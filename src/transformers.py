@@ -1,0 +1,124 @@
+"""PySpark-compatible transformation layer — runs locally with Pandas, swap to PySpark in prod."""
+from typing import List, Optional, Dict
+from datetime import datetime
+import pandas as pd
+import numpy as np
+
+
+def deduplicate(df: pd.DataFrame, key_cols: List[str], keep: str = "last") -> pd.DataFrame:
+    """
+    Idempotent deduplication — watermark-based CDC means the same record can arrive
+    multiple times on pipeline retry. Zero-duplicate guarantee enforced here.
+    """
+    before = len(df)
+    df = df.drop_duplicates(subset=key_cols, keep=keep)
+    dropped = before - len(df)
+    if dropped:
+        print(f"[deduplicate] Dropped {dropped} duplicate rows on {key_cols}")
+    return df
+
+
+def filter_confirmed(df: pd.DataFrame, status_col: str = "status") -> pd.DataFrame:
+    """Only process confirmed transactions downstream."""
+    return df[df[status_col] == "confirmed"].copy()
+
+
+def enrich_time_features(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
+    """Add temporal partitioning columns used downstream for Redshift query performance."""
+    df = df.copy()
+    ts = pd.to_datetime(df[ts_col])
+    df["year"] = ts.dt.year
+    df["month"] = ts.dt.month
+    df["day"] = ts.dt.day
+    df["hour"] = ts.dt.hour
+    df["date_partition"] = ts.dt.strftime("%Y-%m-%d")
+    df["hour_partition"] = ts.dt.strftime("%Y-%m-%d-%H")
+    return df
+
+
+def compute_rolling_aggregates(
+    df: pd.DataFrame,
+    group_col: str = "from_address",
+    amount_col: str = "amount_usd",
+    windows: List[int] = [1, 24, 168],
+) -> pd.DataFrame:
+    """
+    Rolling velocity aggregates — the same features that SageMaker Feature Store
+    serves to all downstream risk models (120 features, 4 models).
+    """
+    df = df.copy().sort_values([group_col, "timestamp"])
+
+    for w in windows:
+        label = f"{w}h" if w < 24 else f"{w // 24}d"
+        df[f"txn_count_{label}"] = (
+            df.groupby(group_col)["timestamp"]
+            .transform(lambda s: s.expanding().count())
+        )
+        df[f"amount_sum_{label}"] = (
+            df.groupby(group_col)[amount_col]
+            .transform(lambda x: x.rolling(window=w, min_periods=1).sum())
+        )
+        df[f"amount_mean_{label}"] = (
+            df.groupby(group_col)[amount_col]
+            .transform(lambda x: x.rolling(window=w, min_periods=1).mean())
+        )
+
+    return df
+
+
+def standardize_amounts(
+    df: pd.DataFrame,
+    amount_col: str = "amount_usd",
+    fee_col: str = "gas_fee_usd",
+) -> pd.DataFrame:
+    """Log-normalize amounts and compute fee ratios for downstream models."""
+    df = df.copy()
+    df["amount_log"] = np.log1p(df[amount_col])
+    df["fee_ratio"] = df[fee_col] / (df[amount_col] + 1e-6)
+    df["total_cost_usd"] = df[amount_col] + df[fee_col]
+    return df
+
+
+def apply_schema_evolution(
+    df: pd.DataFrame,
+    expected_schema: Dict[str, str],
+    fill_defaults: bool = True,
+) -> pd.DataFrame:
+    """
+    Handle schema drift gracefully — new columns from upstream sources are added,
+    missing expected columns are filled with defaults (mirrors Glue Data Catalog versioning).
+    """
+    df = df.copy()
+    for col, dtype in expected_schema.items():
+        if col not in df.columns:
+            if fill_defaults:
+                df[col] = _default_for_dtype(dtype)
+            else:
+                raise ValueError(f"Missing expected column: {col}")
+        else:
+            try:
+                df[col] = df[col].astype(dtype)
+            except (ValueError, TypeError):
+                pass
+    return df
+
+
+def _default_for_dtype(dtype: str):
+    mapping = {
+        "float64": 0.0,
+        "int64": 0,
+        "string": "",
+        "object": None,
+        "bool": False,
+    }
+    return mapping.get(dtype, None)
+
+
+def run_transformations(df: pd.DataFrame) -> pd.DataFrame:
+    """Full transformation chain — called by Airflow DAG."""
+    df = deduplicate(df, key_cols=["transaction_hash"])
+    df = filter_confirmed(df)
+    df = enrich_time_features(df)
+    df = standardize_amounts(df)
+    df = compute_rolling_aggregates(df)
+    return df
