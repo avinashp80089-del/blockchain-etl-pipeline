@@ -151,6 +151,18 @@ def test_validator_split():
 
 # ── Delta Lake ────────────────────────────────────────────────────────────────
 
+_parquet_available = pytest.mark.skipif(
+    True,
+    reason="pyarrow or fastparquet required — install with: pip install pyarrow"
+)
+try:
+    import pyarrow  # noqa: F401
+    _parquet_available = lambda f: f  # no-op decorator when available
+except ImportError:
+    pass
+
+
+@_parquet_available
 def test_delta_write_and_read():
     with tempfile.TemporaryDirectory() as tmpdir:
         table = DeltaTable(tmpdir + "/test_table")
@@ -161,6 +173,7 @@ def test_delta_write_and_read():
         assert len(result) == 3
 
 
+@_parquet_available
 def test_delta_time_travel():
     with tempfile.TemporaryDirectory() as tmpdir:
         table = DeltaTable(tmpdir + "/test_table")
@@ -175,6 +188,7 @@ def test_delta_time_travel():
         assert len(v2_data) == 2
 
 
+@_parquet_available
 def test_delta_history():
     with tempfile.TemporaryDirectory() as tmpdir:
         table = DeltaTable(tmpdir + "/test_table")
